@@ -1,0 +1,21 @@
+# Parameter-efficient training: freezes all ESM-2 parameters except multimer_attn
+# Trains only ~0.5% of total parameters
+# Recommended for production use
+
+extends: ../base/650M.yaml
+
+model:
+  freeze_self_attn: true
+  copy_weights: true
+
+training:
+  lr: 0.0004  # Higher LR OK since only multimer_attn is trained
+  max_steps: 40001
+  use_lora: true
+  
+data:
+  val_examples: 20000
+  num_workers: 16
+
+output:
+  run_name: 650M_frozen_lora

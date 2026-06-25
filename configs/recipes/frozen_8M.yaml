@@ -1,0 +1,31 @@
+# Parameter-efficient training: freezes all FastESM parameters except multimer_attn
+# Trains only ~0.5% of total parameters
+# Pretrained weights auto-download from Synthyra HF Hub
+# Recommended for quick experiments and prototyping
+
+extends: ../base/8M.yaml
+
+model:
+  use_multimer: true
+  copy_weights: true
+
+training:
+  lr: 0.0004  # Higher LR OK since only multimer_attn is trained
+  max_steps: 400000
+  batch_size: 96
+  freeze_self_attn: true
+  accumulate_grad: 1
+  val_check_interval: 2000
+  checkpoint_block_size: 3
+  
+
+data:
+  val_examples: 20000
+  num_workers: 4
+  crop_length: 512
+  val_max_len: 1024
+  data_dir: ./data/diamond
+
+output:
+  run_name: 8M_frozen
+  checkpoint_every: 2000

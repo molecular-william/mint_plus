@@ -1,0 +1,31 @@
+# Parameter-efficient training: freezes all FastESM parameters except multimer_attn
+# Trains only ~0.5% of total parameters
+# Pretrained weights auto-download from Synthyra HF Hub
+# Recommended for quick experiments and prototyping
+
+extends: ../base/35M.yaml
+
+model:
+  copy_weights: true
+  try_opt: true  # try architectural optimizations, but its a bit different than original MINT
+  use_multimer: true
+  layer_spec: ['self','self','self','cross','self','self','self','cross','self','self','self','cross','self','self','self','cross']
+  per_chain_rope: true
+
+training:
+  freeze_self_attn: true
+  lr: 0.0008
+  max_steps: 400000
+  batch_size: 100  # 100 and larger is possible for try_opt = true, 24 barely fits for try_opt = false
+  accumulate_grad: 1
+  val_check_interval: 2000
+  
+
+data:
+  val_examples: 20000
+  num_workers: 8
+  data_dir: ./data/diamond
+
+output:
+  run_name: 35M_frozen_opt
+  checkpoint_every: 2000

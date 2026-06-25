@@ -1,0 +1,33 @@
+model:
+  size: fast_esm_650M
+  use_multimer: true
+  token_dropout: true
+
+training:
+  max_steps: 300000
+  batch_size: 2
+  accumulate_grad: 32
+  grad_clip: 1.0
+  warmup_steps: 2000
+  lr: 0.0001
+  weight_decay: 0.01
+  adam_betas: "[0.9, 0.98]"
+  adam_eps: 1.0e-8
+  end_learning_rate: 1.0e-5
+  val_check_interval: 50000
+  print_freq: 100
+
+data:
+  split: filtered
+  crop_length: 2048
+  val_max_len: 1024
+  val_examples: 250000
+  data_dir: ./data
+  overfit: 0
+
+output:
+  run_name: fast_esm_650M_base
+  checkpoint_dir: ./checkpoints
+  wandb: false
+  checkpoint_every: 50000
+  save_top_k: -1

@@ -1,0 +1,28 @@
+# Parameter-efficient training: freezes all FastESM parameters except multimer_attn
+# Trains only ~0.5% of total parameters
+# Pretrained weights auto-download from Synthyra HF Hub
+# Recommended for quick experiments and prototyping
+
+extends: ../base/8M.yaml
+
+model:
+  freeze_self_attn: true
+  copy_weights: true
+  try_opt: true  # try architectural optimizations, but its a bit different than original MINT
+
+training:
+  lr: 0.0004  # Higher LR OK since only multimer_attn is trained
+  max_steps: 400000
+  use_lora: true
+  batch_size: 64
+  accumulate_grad: 1
+  val_check_interval: 2000
+  
+
+data:
+  val_examples: 20000
+  num_workers: 16
+
+output:
+  run_name: 8M_frozen_lora
+  checkpoint_every: 2000

@@ -1,0 +1,20 @@
+# Shared LoRA configuration defaults
+# Inherits from a base model config and adds LoRA settings
+#
+# Usage:
+#   extends: ../base/650M.yaml
+#   model:
+#     apply_lora: true
+#     lora_rank: 16
+#     lora_alpha: 32
+#     lora_dropout: 0.05
+#     lora_target_modules: all   # all | attn | attn_ffn | q_proj,k_proj
+
+model:
+  apply_lora: true
+  lora_rank: 16
+  lora_alpha: 32.0
+  lora_dropout: 0.05
+  lora_target_modules: "all"
+  freeze_backbone: true
+  merge_lora: false

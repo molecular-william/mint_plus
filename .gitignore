@@ -1,0 +1,6 @@
+ckpts/
+data/
+mint_original/
+test.ipynb
+.ipynb_checkpoints/
+__pycache__/

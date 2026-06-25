@@ -1,0 +1,22 @@
+extends: ../base/8M.yaml
+
+model:
+  copy_weights: true
+  try_flex: true  # try a flex attention implementation
+
+training:
+  lr: 0.0008
+  max_steps: 400000
+  batch_size: 768 #128 # 128 and larger is possible for try_opt = true, 24 barely fits for try_opt = false
+  accumulate_grad: 1
+  val_check_interval: 2000
+  
+
+data:
+  val_examples: 20000
+  num_workers: 4
+  data_dir: ./data/diamond
+
+output:
+  run_name: 8M_no_frozen_flex
+  checkpoint_every: 2000

@@ -1,0 +1,26 @@
+extends: ../base/150M.yaml
+
+model:
+  copy_weights: true
+  try_flex: true  # try a flex attention implementation
+  use_multimer: true
+
+training:
+  lr: 0.0004
+  freeze_self_attn: true
+  max_steps: 400000
+  batch_size: 8  # activation checkpointing saves a LOT of memory
+  accumulate_grad: 1
+  val_check_interval: 2000
+  use_muon: false  # seems to make training worse, need to tune batch size
+  fp8: false  # memory not much lower
+  use_galore: false
+
+data:
+  val_examples: 20000
+  num_workers: 8
+  data_dir: ./data/diamond
+
+output:
+  run_name: 650M_frozen_flex
+  checkpoint_every: 2000
