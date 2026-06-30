@@ -21,12 +21,13 @@ class _MultiPathwayAttentionFn(Function):
 
     @staticmethod
     def forward(ctx, q_self, k_self, v_self, q_multi, k_multi, v_multi,
-                chain_mask, dropout_p, training, qpp):
+                chain_mask, dropout_p, training, qpp, sqrt_softmax):
         # Save for backward
         ctx.save_for_backward(q_self, k_self, v_self, q_multi, k_multi, v_multi,
                               chain_mask)
         ctx.dropout_p = dropout_p
         ctx.training = training
+        ctx.sqrt_softmax = sqrt_softmax
 
         # Forward via Triton kernel
         from mint_plus.models.kernels.multi_pathway_attention import \
@@ -34,6 +35,7 @@ class _MultiPathwayAttentionFn(Function):
         output = fused_multi_pathway_attention(
             q_self, k_self, v_self, q_multi, k_multi, v_multi,
             chain_mask, dropout_p=dropout_p, training=training, qpp=qpp,
+            sqrt_softmax=sqrt_softmax,
         )
         return output
 
@@ -42,32 +44,44 @@ class _MultiPathwayAttentionFn(Function):
         q_self, k_self, v_self, q_multi, k_multi, v_multi, chain_mask = \
             ctx.saved_tensors
 
-        # Use the Triton backward kernel (tiled, no (B,H,T,T) materialization)
-        from mint_plus.models.kernels.multi_pathway_attention_bwd import (
-            fused_multi_pathway_attention_bwd)
-        dq_self, dk_self, dv_self, dq_multi, dk_multi, dv_multi = \
-            fused_multi_pathway_attention_bwd(
-                q_self, k_self, v_self, q_multi, k_multi, v_multi,
-                chain_mask, grad_output,
-            )
+        # Ensure contiguous for Triton kernel access (saved tensors may
+        # have non-contiguous strides from the autograd engine).
+        # Also use torch.no_grad() because Triton kernel in-place writes
+        # (tl.store, tl.atomic_add) confuse PyTorch's autograd engine
+        # when grad is enabled.
+        with torch.no_grad():
+            # Use the Triton backward kernel (tiled, no (B,H,T,T) materialization)
+            from mint_plus.models.kernels.multi_pathway_attention_bwd import (
+                fused_multi_pathway_attention_bwd)
+            dq_self, dk_self, dv_self, dq_multi, dk_multi, dv_multi = \
+                fused_multi_pathway_attention_bwd(
+                    q_self.contiguous(), k_self.contiguous(), v_self.contiguous(),
+                    q_multi.contiguous(), k_multi.contiguous(), v_multi.contiguous(),
+                    chain_mask.contiguous(), grad_output.contiguous(),
+                    sqrt_softmax=ctx.sqrt_softmax,
+                )
 
         return (dq_self, dk_self, dv_self, dq_multi, dk_multi, dv_multi,
-                None, None, None, None)
+                None, None, None, None, None)
 
 
 # Public API -- drop-in replacement for fused_multi_pathway_attention
 def differentiable_multi_pathway_attention(
     q_self, k_self, v_self, q_multi, k_multi, v_multi,
     chain_mask, dropout_p=0.0, training=True, qpp=8,
+    sqrt_softmax=False,
 ):
     """Same interface as fused_multi_pathway_attention but with autograd support.
 
     During forward: uses the fast Triton kernel.
     During backward: uses the Triton backward kernel (tiled, atomic_add).
+
+    Args:
+        sqrt_softmax: Use sqrt(softmax) coefficients (muS mode).
     """
     return _MultiPathwayAttentionFn.apply(
         q_self, k_self, v_self, q_multi, k_multi, v_multi,
-        chain_mask, dropout_p, training, qpp,
+        chain_mask, dropout_p, training, qpp, sqrt_softmax,
     )
 
 

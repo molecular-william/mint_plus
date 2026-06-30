@@ -92,7 +92,12 @@ class MINTWrapper(pl.LightningModule):
         eps = self.training_config.get("adam_eps", 1e-8)
         weight_decay = self.training_config.get("weight_decay", 0.01)
         freeze_attn = self.training_config.get("freeze_self_attn", False)
-        
+        architecture = self.model_config.get("architecture", "standard")
+
+        # muS: different LRs for different parameter groups
+        if architecture == "mus":
+            return self._configure_mu_optimizers(lr, betas, eps, weight_decay)
+
         # Handle layer freezing configurations if requested
         if freeze_attn:
             self.model.requires_grad_(False)
@@ -127,6 +132,39 @@ class MINTWrapper(pl.LightningModule):
         # 3. Attach Learning Rate Scheduler
         scheduler = self._configure_lr_schedulers(optimizer)
 
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
+
+    # ---- muS Optimizer (different LR per parameter group) ----
+
+    def _configure_mu_optimizers(self, lr, betas, eps, weight_decay):
+        """muS optimizer with per-group LR scaling.
+
+        Hidden layers: LR = base_lr * sqrt(d_base / d_new)
+        Embedding:     LR = base_lr
+        LM head:       LR = base_lr
+        """
+        from mint_plus.models.mu_scaling.optim import build_mu_param_groups
+
+        hidden_dim = self.model_config.get("embed_dim", 640)
+        base_width = self.training_config.get("base_width", 320)
+
+        param_groups = build_mu_param_groups(
+            self.model, base_lr=lr, hidden_dim=hidden_dim,
+            weight_decay=weight_decay, base_width=base_width,
+        )
+        logger.info(
+            f"muS optimizer: {len(param_groups)} groups, "
+            f"LRs={[g['lr'] for g in param_groups]}"
+        )
+
+        optimizer = torch.optim.AdamW(
+            param_groups, betas=betas, eps=eps, fused=True,
+        )
+
+        scheduler = self._configure_lr_schedulers(optimizer)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},

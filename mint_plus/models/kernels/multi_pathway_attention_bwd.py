@@ -16,6 +16,7 @@ def fused_multi_pathway_attention_bwd(
     q_self, k_self, v_self, q_multi, k_multi, v_multi,
     chain_mask, grad_output,
     BLOCK_TQ=8, BLOCK_TK=None, QPP=8,
+    sqrt_softmax=False,
 ):
     B, H, T, D = q_self.shape
     if BLOCK_TK is None:
@@ -51,7 +52,8 @@ def fused_multi_pathway_attention_bwd(
                   q_self.stride(0), q_self.stride(1), q_self.stride(2), q_self.stride(3),
                   chain_mask.stride(0), chain_mask.stride(1), chain_mask.stride(2),
                   B=B, H=H, T=T, D=D, num_q_groups=num_q_groups,
-                  BLOCK_TQ=BLOCK_TQ, BLOCK_TK=BLOCK_TK, QPP=QPP, NQ=NQ)
+                  BLOCK_TQ=BLOCK_TQ, BLOCK_TK=BLOCK_TK, QPP=QPP, NQ=NQ,
+                  SQRT_SOFTMAX=sqrt_softmax)
 
     return dq_s, dk_s.to(torch.bfloat16), dv_s.to(torch.bfloat16), \
            dq_m, dk_m.to(torch.bfloat16), dv_m.to(torch.bfloat16)
@@ -124,7 +126,8 @@ def _phase2(q_sp, k_sp, v_sp, q_mp, k_mp, v_mp, mask_ptr, dout_ptr, stats_ptr,
             B: tl.constexpr, H: tl.constexpr, T: tl.constexpr, D: tl.constexpr,
             num_q_groups: tl.constexpr,
             BLOCK_TQ: tl.constexpr, BLOCK_TK: tl.constexpr,
-            QPP: tl.constexpr, NQ: tl.constexpr):
+            QPP: tl.constexpr, NQ: tl.constexpr,
+            SQRT_SOFTMAX: tl.constexpr = False):
     """Phase 2: compute gradients for one query group using pre-computed (m, d)."""
     pid = tl.program_id(0)
     qg_idx = pid % num_q_groups
@@ -182,13 +185,30 @@ def _phase2(q_sp, k_sp, v_sp, q_mp, k_mp, v_mp, mask_ptr, dout_ptr, stats_ptr,
         comb = tl.where(msk, el, il)
         probs = tl.exp(comb - m[:, None]) / d_safe[:, None]
 
-        intra_probs = tl.where(~msk, probs, 0.0)
-        inter_probs = tl.where(msk, probs, 0.0)
-        ip_bf16 = intra_probs.to(tl.bfloat16)
-        ep_bf16 = inter_probs.to(tl.bfloat16)
+        if SQRT_SOFTMAX:
+            # muS: sqrt-softmax
+            # q = sqrt(p) where p = softmax
+            # dV: use q coefficients for weighted sum
+            # dlogits: v = dL/dq * q / 2, dlogits = v - p * sum(v)
+            q_f32 = tl.sqrt(probs.to(tl.float32))  # sqrt(softmax), variance-preserving
+            intra_q = tl.where(~msk, q_f32.to(tl.bfloat16), 0.0)
+            inter_q = tl.where(msk, q_f32.to(tl.bfloat16), 0.0)
+        else:
+            # Standard softmax: use probs directly
+            intra_p = tl.where(~msk, probs, 0.0)
+            inter_p = tl.where(msk, probs, 0.0)
+            ip_bf16 = intra_p.to(tl.bfloat16)
+            ep_bf16 = inter_p.to(tl.bfloat16)
 
-        dv_block_s = tl.dot(tl.trans(ip_bf16), dout_bf16)
-        dv_block_m = tl.dot(tl.trans(ep_bf16), dout_bf16)
+        # dV block: depends on pathway coefficients
+        if SQRT_SOFTMAX:
+            dv_block_s = tl.dot(tl.trans(intra_q), dout_bf16)
+            dv_block_m = tl.dot(tl.trans(inter_q), dout_bf16)
+        else:
+            dv_block_s = tl.dot(tl.trans(ip_bf16), dout_bf16)
+            dv_block_m = tl.dot(tl.trans(ep_bf16), dout_bf16)
+
+        # dL/d(coeff): dout @ V^T  (same computation for both variants)
         dp_intra = tl.dot(dout_bf16, tl.trans(v_s),
                           acc=tl.zeros((NQ, BLOCK_TK), dtype=tl.float32))
         dp_inter = tl.dot(dout_bf16, tl.trans(v_m),
@@ -197,11 +217,22 @@ def _phase2(q_sp, k_sp, v_sp, q_mp, k_mp, v_mp, mask_ptr, dout_ptr, stats_ptr,
         dp_inter = tl.where(msk, dp_inter, 0.0)
         dp_combined = dp_intra + dp_inter
 
-        p_f32 = probs.to(tl.float32)
-        dp_f32 = dp_combined.to(tl.float32)
-        p_dp = p_f32 * dp_f32
-        sum_p_dp = tl.sum(p_dp, axis=1)
-        dlogits = p_f32 * (dp_f32 - sum_p_dp[:, None])
+        # Logit gradient
+        if SQRT_SOFTMAX:
+            # sqrt-softmax backward: dlogits = v - p * sum(v)
+            # where v = dL/dq * q / 2, p = q^2 = softmax
+            p_f32 = probs.to(tl.float32)
+            dq_f32 = dp_combined.to(tl.float32)
+            v = dq_f32 * q_f32 * 0.5
+            sum_v = tl.sum(v, axis=1)
+            dlogits = v - p_f32 * sum_v[:, None]
+        else:
+            # Standard softmax backward: dlogits = p * (dp - sum(p*dp))
+            p_f32 = probs.to(tl.float32)
+            dp_f32 = dp_combined.to(tl.float32)
+            p_dp = p_f32 * dp_f32
+            sum_p_dp = tl.sum(p_dp, axis=1)
+            dlogits = p_f32 * (dp_f32 - sum_p_dp[:, None])
         dl_intra = tl.where(~msk, dlogits, 0.0)
         dl_inter = tl.where(msk, dlogits, 0.0)
         dl_intra_bf16 = dl_intra.to(tl.bfloat16)

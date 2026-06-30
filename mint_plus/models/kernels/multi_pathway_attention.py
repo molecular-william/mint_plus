@@ -41,6 +41,7 @@ def _fused_multi_pathway_kernel(
     QPP: tl.constexpr,  # query blocks per program
     DROPOUT_P: tl.constexpr,
     seed: int,  # NOT constexpr -- avoids recompilation when seed changes
+    SQRT_SOFTMAX: tl.constexpr = False,  # muS: sqrt(softmax) for variance preservation
 ):
     """FA-2 style: one program handles QPP * BLOCK_TQ queries.
 
@@ -134,21 +135,36 @@ def _fused_multi_pathway_kernel(
         sum_exp = tl.sum(exp_corrected, axis=1)                  # (NQ,)
 
         # Scale old accumulators
-        acc = acc * old_scale[:, None]
+        if SQRT_SOFTMAX:
+            # muS sqrt-softmax: acc = acc * sqrt(old_scale), d = d * old_scale + sum_exp
+            sqrt_old_scale = tl.sqrt(old_scale)
+            acc = acc * sqrt_old_scale[:, None]
+        else:
+            acc = acc * old_scale[:, None]
         d = d * old_scale + sum_exp
 
-        # Split probs by pathway and fuse weighted sum directly into acc
-        intra_probs = tl.where(~mask_block, exp_corrected, 0.0).to(tl.bfloat16)
-        inter_probs = tl.where(mask_block, exp_corrected, 0.0).to(tl.bfloat16)
+        # Split probs/coeffs by pathway and fuse weighted sum directly into acc
+        if SQRT_SOFTMAX:
+            # muS: coeffs = sqrt(softmax) = sqrt(exp_corrected) / sqrt(d)
+            # But we accumulate sqrt(exp_corrected) and normalize at the end.
+            sqrt_exp = tl.sqrt(exp_corrected)
+            intra_coeffs = tl.where(~mask_block, sqrt_exp, 0.0).to(tl.bfloat16)
+            inter_coeffs = tl.where(mask_block, sqrt_exp, 0.0).to(tl.bfloat16)
+        else:
+            intra_coeffs = tl.where(~mask_block, exp_corrected, 0.0).to(tl.bfloat16)
+            inter_coeffs = tl.where(mask_block, exp_corrected, 0.0).to(tl.bfloat16)
 
         # Fused FMA: acc = tl.dot(probs, V, acc) saves one add instruction
-        acc = tl.dot(intra_probs, v_self, acc)
-        acc = tl.dot(inter_probs, v_multi, acc)
+        acc = tl.dot(intra_coeffs, v_self, acc)
+        acc = tl.dot(inter_coeffs, v_multi, acc)
         m = new_m
 
     # ---- 4. Normalize ----
     d_safe = tl.where(d > 0, d, 1.0)
-    output = acc / d_safe[:, None]
+    if SQRT_SOFTMAX:
+        output = acc / tl.sqrt(d_safe[:, None])
+    else:
+        output = acc / d_safe[:, None]
 
     # ---- 5. Dropout (fused) ----
     if DROPOUT_P > 0:
@@ -176,6 +192,7 @@ def fused_multi_pathway_attention(
     dropout_p: float = 0.0,
     training: bool = True,
     qpp: int = None,
+    sqrt_softmax: bool = False,
 ) -> torch.Tensor:
     """Multi-pathway fused attention with K/V reuse across query blocks.
 
@@ -183,6 +200,10 @@ def fused_multi_pathway_attention(
       1. Projecting Q/K/V via MultiHeadAttention.project_qkv_4d()
       2. Applying scaling to Q: q = q * (1/sqrt(D))
       3. Applying RoPE to Q_self and K_self
+
+    When sqrt_softmax=True (muS mode), uses sqrt(softmax) coefficients for
+    the attention-weighted sum. This preserves activation variance across
+    sequence positions (see Proposition 2.1 in the muS paper).
 
     The `qpp` parameter controls how many BLOCK_TQ blocks each program
     processes. Higher QPP = fewer K/V global reads, more registers consumed.
@@ -195,6 +216,7 @@ def fused_multi_pathway_attention(
         dropout_p: probability (0.0 = disabled).
         training: whether in training mode.
         qpp: query blocks per program override.
+        sqrt_softmax: use sqrt(softmax) instead of softmax (muS mode).
 
     Returns:
         (B, H, T, D) bf16, ready for output projection.
@@ -253,5 +275,6 @@ def fused_multi_pathway_attention(
         BLOCK_TQ=BLOCK_TQ, BLOCK_TK=BLOCK_TK, QPP=QPP,
         DROPOUT_P=dropout_p if training else 0.0,
         seed=seed,
+        SQRT_SOFTMAX=sqrt_softmax,
     )
     return output

@@ -6,16 +6,21 @@
 extends: ../base/8M.yaml
 
 model:
-  copy_weights: true
+  checkpoint: false
+  copy_weights: false #true
   use_multimer: true
 
 training:
   lr: 0.0008
+  linear_decay: false #true  # uses paper's original linear decay
+  use_erf_gelu: false #true  # uses paper's original erf gelu
   max_steps: 400000
-  batch_size: 128  # larger batch possible due to activation checkpointing
+  batch_size: 256  # larger batch possible due to activation checkpointing  --> 14.6 GB
   accumulate_grad: 1
   val_check_interval: 2000
-  checkpoint_block_size: 3
+  checkpoint_block_size: 0
+  use_fused_multi_pathway: true
+  use_compile: true  # torch.compile disabled by default (causes CUDA errors)
   
 
 data:

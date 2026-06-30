@@ -73,8 +73,8 @@ class MINTTrainer:
         self.batch_size = self.training_config.get('batch_size', 2)
             
         val_ds = STRINGDataset(
-            links_path=data_dir + '/' + "validation.links.txt.gz",
-            seqs_path=data_dir + '/' + "validation.seqs.txt.gz",
+            links_path=data_dir + '/' + "validation.links.txt.zst",
+            seqs_path=data_dir + '/' + "validation.seqs.txt.zst",
             global_rank=self.lightning_trainer.global_rank,
             world_size=self.lightning_trainer.world_size,
             max_examples=self.data_config.get('val_examples', 250_000),
@@ -90,8 +90,8 @@ class MINTTrainer:
         )
 
         train_ds = STRINGDataset(
-            links_path=data_dir + '/' + "training_filtered.links.txt.gz",
-            seqs_path=data_dir + '/' + "training_filtered.seqs.txt.gz",
+            links_path=data_dir + '/' + "training_filtered.links.txt.zst",
+            seqs_path=data_dir + '/' + "training_filtered.seqs.txt.zst",
             global_rank=self.lightning_trainer.global_rank,
             world_size=self.lightning_trainer.world_size,
             )

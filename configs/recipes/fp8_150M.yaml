@@ -1,0 +1,39 @@
+# FP8 fine-tuning (Pre-LN architecture + te.Linear).
+#
+# No architectural changes — keeps standard Pre-LayerNorm and additive residuals.
+# ESM-2 pre-trained weights are fully compatible.
+# Only the nn.Linear layers are replaced with te.Linear for FP8 computation.
+#
+# This is the "Option B" path: full pre-trained weight compatibility,
+# ~30% speedup from FP8 Tensor Cores, no warm-start issues.
+
+extends: ../base/150M.yaml
+
+model:
+  architecture: fp8             # standard | mus | fp8
+  size: 150M
+  use_multimer: true
+
+training:
+  fp8: true
+  fp8_static_scaling: true      # muS-style static scaling (no DelayedScaling)
+  lr: 0.0004
+  linear_decay: true
+  max_steps: 400000
+  batch_size: 64
+  accumulate_grad: 1
+  val_check_interval: 2000
+  freeze_self_attn: true
+  checkpoint_block_size: 3
+  use_fused_multi_pathway: true   # super-fused kernel works with Pre-LN
+
+data:
+  val_examples: 20000
+  crop_length: 512
+  val_max_len: 1024
+  num_workers: 8
+  data_dir: ./data/diamond
+
+output:
+  run_name: 150M_fp8
+  checkpoint_every: 2000

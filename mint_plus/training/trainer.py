@@ -1,7 +1,6 @@
 import lightning as pl
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
-from peft import LoraConfig, get_peft_model
 from typing import Any, Dict, Optional
 from pathlib import Path
 # from lightning.pytorch.strategies import DDPStrategy
@@ -12,6 +11,7 @@ from mint_plus.models.esm2 import MINT
 #from mint_plus.models.esm2_flex import MINT_flex
 from mint_plus.models.modules import build_checkpointed_model
 from mint_plus.models.modules import enable_fused_multi_pathway
+from mint_plus.models.mu_scaling import build_mint_mu, build_mint_fp8
 from mint_plus.training.wrapper import MINTWrapper
 from mint_plus.training.config import load_config
 
@@ -35,15 +35,13 @@ class MINTTrainer:
         self.output_config = config.get("output", {})
 
         self.model = self._build_model()
-        # Optional: torch.compile (disabled by default -- super-fused kernel
-        # already runs at 715 ms/step eager. Compile can OOM or produce
-        # illegal-memory-access errors on the RoPE path when combined with
-        # checkpointing + Triton kernels. Enable only if eager is too slow.)
+
         if self.training_config.get("use_compile", False):
             import torch._inductor.config as inductor_cfg
             inductor_cfg.max_fusion_size = 8
             self.model = torch.compile(self.model, mode='reduce-overhead')
             logger.info("torch.compile enabled (reduce-overhead mode)")
+            
         self.wrapper = self._build_wrapper()  # freeze_self_attn is processed here
         self.lightning_trainer = self._build_trainer()
         self.train_loader, self.val_loader = self._build_dataloaders()
@@ -84,8 +82,8 @@ class MINTTrainer:
         self.batch_size = self.training_config.get('batch_size', 2)
             
         val_ds = STRINGDataset(
-            links_path=data_dir + '/' + "validation.links.txt.gz",
-            seqs_path=data_dir + '/' + "validation.seqs.txt.gz",
+            links_path=data_dir + '/' + "validation.links.txt.zst",
+            seqs_path=data_dir + '/' + "validation.seqs.txt.zst",
             global_rank=self.lightning_trainer.global_rank,
             world_size=self.lightning_trainer.world_size,
             max_examples=self.data_config.get('val_examples', 250_000),
@@ -101,8 +99,8 @@ class MINTTrainer:
         )
 
         train_ds = STRINGDataset(
-            links_path=data_dir + '/' + "training_filtered.links.txt.gz",
-            seqs_path=data_dir + '/' + "training_filtered.seqs.txt.gz",
+            links_path=data_dir + '/' + "training_filtered.links.txt.zst",
+            seqs_path=data_dir + '/' + "training_filtered.seqs.txt.zst",
             global_rank=self.lightning_trainer.global_rank,
             world_size=self.lightning_trainer.world_size,
             )
@@ -124,51 +122,70 @@ class MINTTrainer:
         self.try_flex = self.model_config.get("try_flex", False)
         self.fp8 = self.training_config.get("fp8", False)
         self.use_erf_gelu = self.model_config.get("use_erf_gelu", False)
-        # creates the backbone
-        if self.try_flex:
-            model = MINT_flex.from_config(self.model_size, try_flex=True, fp8=self.fp8)
-        else:
-            model = MINT.from_config(self.model_size, fp8=self.fp8, use_erf_gelu=self.use_erf_gelu)
+        self.architecture = self.model_config.get("architecture", "standard")
 
-        dtype = torch.bfloat16#float32#torch.bfloat16
-        #model.to(dtype)
-        
+        if self.architecture == "mus":
+            # muS architecture: Res-Post-LN, weighted residuals, sqrt-softmax, optional FP8
+            logger.info(f"Building muS architecture (model_size={self.model_size})")
+            model = build_mint_mu(
+                model_size=self.model_size,
+                use_multimer=self.use_multimer,
+                tau=self.training_config.get("tau", None),
+                use_sqrt_softmax=self.training_config.get("use_sqrt_softmax", True),
+                use_fp8=self.fp8,
+                fp8_static_scale=self.training_config.get("fp8_static_scaling", True),
+                warm_start_esm2=self.model_config.get("warm_start_esm2", False),
+                checkpoint_block_size=self.training_config.get("checkpoint_block_size", 0),
+                use_fused_multi_pathway=self.training_config.get("use_fused_multi_pathway", False),
+            )
+
+        elif self.architecture == "fp8":
+            # FP8 on Pre-LN: standard architecture + te.Linear
+            logger.info(f"Building FP8 model (Pre-LN + te.Linear, model_size={self.model_size})")
+            model = build_mint_fp8(
+                model_size=self.model_size,
+                use_multimer=self.use_multimer,
+                static_scale=self.training_config.get("fp8_static_scaling", True),
+                checkpoint_block_size=self.training_config.get("checkpoint_block_size", 3),
+                use_fused_multi_pathway=self.training_config.get("use_fused_multi_pathway", True),
+            )
+
+        else:
+            # Standard architecture (existing path)
+            if self.try_flex:
+                model = MINT_flex.from_config(self.model_size, try_flex=True, fp8=self.fp8)
+            else:
+                model = MINT.from_config(self.model_size, fp8=self.fp8, use_erf_gelu=self.use_erf_gelu)
+
+        dtype = torch.float32  # weights stay in fp32; AMP handles casting
+        # model.to(dtype)
+
+        # Checkpoint loading
         ckpt_path = self.model_config.get("checkpoint", None)
         if ckpt_path and Path(ckpt_path).exists():
-            # self._weight_sanity_check(model, '')
-            model.load_pretrained_weights(ckpt_path, dtype=dtype)
-            # self._weight_sanity_check(model, '(pre-training weights) ')
-            
-            logger.info(f"Starting with pre-trained weights.")
+            if self.architecture == "mus":
+                # muS warm-start: drop incompatible keys
+                from mint_plus.models.mu_scaling.warm_start import warm_start_from_esm2
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                n = warm_start_from_esm2(model, ckpt)
+                logger.info(f"muS warm-start: loaded {n} weight tensors from {ckpt_path}")
+            else:
+                model.load_pretrained_weights(ckpt_path, dtype=dtype)
+                logger.info(f"Starting with pre-trained weights from {ckpt_path}")
         else:
-            logger.info(f"Starting with Xavier initialized weights.")
+            logger.info(f"Starting with randomly initialized weights.")
 
-        if self.training_config.get("use_lora", False):
-            peft_config = LoraConfig(
-                r=self.training_config.get("lora_r", 8),
-                lora_alpha=self.training_config.get("lora_alpha", 16),
-                lora_dropout=0.05,
-                bias="none",
-                # target_modules strings match the specific sub-modules inside your MultiHeadAttention
-                target_modules=["q_proj", "k_proj", "v_proj"], 
-            )
-            # get_peft_model handles the frozen base weights and configures gradients automatically
-            model = get_peft_model(model, peft_config)
-        
-            # Optional: verify parameters
-            model.print_trainable_parameters()
+        # Block-level checkpointing (for pre-LN standard path only)
+        if self.architecture == "standard":
+            ckpt_block = self.training_config.get("checkpoint_block_size", 0)
+            if ckpt_block > 0:
+                model = build_checkpointed_model(model, block_size=ckpt_block)
+                logger.info(f"Optimization: block-level checkpointing (block_size={ckpt_block})")
 
-        # Apply optimizations: fused multimer attention + block-level checkpointing
-        ckpt_block = self.training_config.get("checkpoint_block_size", 0)
-        if ckpt_block > 0:
-            # flex model -- only block checkpointing, no fused kernel
-            model = build_checkpointed_model(model, block_size=ckpt_block)
-            logger.info(f"Optimization: block-level checkpointing (block_size={ckpt_block}, flex mode)")
-
-        # Multi-pathway fused attention (Phase 2): avoids (B, H, T, T) logit materialization
-        if self.training_config.get("use_fused_multi_pathway", False):
+        # Multi-pathway fused attention (for pre-LN standard path only)
+        if self.architecture == "standard" and self.training_config.get("use_fused_multi_pathway", False):
             enable_fused_multi_pathway(model, enabled=True)
-            logger.info("Optimization: multi-pathway fused attention kernel enabled (~5x combine speedup)")
+            logger.info("Optimization: multi-pathway fused attention kernel enabled")
 
         return model
 

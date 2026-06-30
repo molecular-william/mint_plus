@@ -1,0 +1,66 @@
+# muS (unit Scaling) FP8 training configuration for 150M frozen-params model.
+#
+# Architecture:
+#   model.architecture: mus  -> Res-Post-LN + weighted residuals + sqrt-softmax
+#   training.fp8: true       -> FP8 on all hidden linear layers via te.Linear
+#   training.fp8_static_scaling: true -> muS-style, no DelayedScaling overhead
+#
+# Training from scratch or warm-start from ESM-2:
+#   model.warm_start_esm2: true  -> load compatible ~85% weights, init rest randomly
+#   model.checkpoint: path/to/esm2_150M.pt  -> actual checkpoint file
+#
+# Hyperparameters follow the muS paper:
+#   tau: 0.08 (auto-computed from L=30 for 150M model)
+#   lr_scale_hidden: sqrt(d_base/d_new) = sqrt(320/640) = 0.707
+#   base_width: 320 (ESM-2 8M embed_dim, suitable for zero-shot transfer)
+
+extends: ../base/150M.yaml
+
+model:
+  architecture: mus            # standard | mus | fp8
+  size: 150M
+  use_multimer: true
+  use_erf_gelu: true           # matches original ESM-2
+  warm_start_esm2: true        # load compatible ESM-2 weights, init rest randomly
+  # checkpoint: ./ckpts/esm2_150M/pytorch_model.bin  # set this for warm-start
+
+training:
+  # FP8
+  fp8: true
+  fp8_static_scaling: true     # muS-style static scaling (no DelayedScaling)
+
+  # muS architecture
+  tau: ~                        # auto-computed from depth (30 layers -> ~0.08)
+  use_sqrt_softmax: true        # sqrt-softmax for variance preservation
+
+  # muS LR rules
+  lr: 0.0004                    # base LR (tuned on 8M / width=320)
+  base_width: 320               # base model width for hyperparameter transfer
+  linear_decay: true            # uses paper's original linear decay
+  max_steps: 400000
+  batch_size: 64                # increase from 32 (FP8 saves memory)
+  accumulate_grad: 1
+  val_check_interval: 2000
+
+  # Freeze self-attention (only multimer + LM head train)
+  freeze_self_attn: true
+
+  # Gradient checkpointing (muS uses its own)
+  checkpoint_block_size: 3
+
+  # Super-fused kernel: enabled. The SQRT_SOFTMAX flag is now supported
+  # in the Triton kernel (both forward and backward), using the correct
+  # online rescaling math (sqrt(old_scale) for acc, sqrt(d) for normalization)
+  # and the matching backward formula (gradient through sqrt).
+  use_fused_multi_pathway: true
+
+data:
+  val_examples: 20000
+  crop_length: 512
+  val_max_len: 1024
+  num_workers: 8
+  data_dir: ./data/diamond
+
+output:
+  run_name: 150M_mu_fp8
+  checkpoint_every: 2000

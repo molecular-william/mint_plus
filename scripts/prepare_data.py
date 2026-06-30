@@ -5,6 +5,7 @@ Optimized to handle billions of links without intermediate memory bloat or slow 
 """
 
 import gzip
+import zstandard as zstd
 import random
 import sys
 import gc
@@ -199,10 +200,10 @@ def prepare_data_stream_optimized(
 
     num_train_link = 0
     with gzip.open(links_file, "rt") as f_src, \
-         gzip.open(output_dir / "validation.links.txt.gz", "wt") as f_v_lnk, \
-         gzip.open(output_dir / "validation.seqs.txt.gz", "wt") as f_v_seq, \
-         gzip.open(output_dir / "training_filtered.links.txt.gz", "wt") as f_tf_lnk, \
-         gzip.open(output_dir / "training_filtered.seqs.txt.gz", "wt") as f_tf_seq:
+         zstd.open(output_dir / "validation.links.txt.zst", "wt", encoding="ascii") as f_v_lnk, \
+         zstd.open(output_dir / "validation.seqs.txt.zst", "wt", encoding="ascii") as f_v_seq, \
+         zstd.open(output_dir / "training_filtered.links.txt.zst", "wt", encoding="ascii") as f_tf_lnk, \
+         zstd.open(output_dir / "training_filtered.seqs.txt.zst", "wt", encoding="ascii") as f_tf_seq:
 
         next(f_src)  # Skip Header
         

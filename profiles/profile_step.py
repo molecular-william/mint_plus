@@ -60,8 +60,8 @@ def build_model():
 def get_data_loader(batch_size=32, crop_length=512, max_examples=5000):
     collate_fn = CollateFn(crop_length)
     ds = STRINGDataset(
-        links_path="data/diamond/validation.links.txt.gz",
-        seqs_path="data/diamond/validation.seqs.txt.gz",
+        links_path="data/diamond/validation.links.txt.zst",
+        seqs_path="data/diamond/validation.seqs.txt.zst",
         global_rank=0, world_size=1, max_examples=max_examples
     )
     loader = torch.utils.data.DataLoader(

@@ -33,6 +33,12 @@ Directory Structure
       modules_plus.py        -- TransformerLayer_MINT_plus (fused QKV),
                                 build_mint_plus()
       rotary_embedding.py    -- RoPE implementation
+      mu_scaling/            -- muS (unit Scaling) architecture + FP8
+        __init__.py          -- build_mint_mu(), build_mint_fp8(), apply_fp8_to_model()
+        layer.py             -- TransformerLayer_MINT_mu (Res-Post-LN)
+        init.py              -- Unit variance initialization
+        optim.py             -- Tau computation, LR scaling rules
+        warm_start.py        -- ESM-2 weight adapter for muS
       kernels/
         __init__.py          -- fused_multimer_combine (Triton)
         multi_pathway_attention.py   -- super-fused attention kernel
@@ -61,6 +67,8 @@ Directory Structure
     recipes/
       frozen_8M.yaml, frozen_35M.yaml, frozen_150M.yaml  -- Freeze mode
       no_frozen_8M.yaml                                  -- Full fine-tune
+      mu_fp8_150M.yaml                                   -- muS + FP8 from scratch
+      fp8_150M.yaml                                      -- FP8 on Pre-LN (fine-tune)
 
   mint/ (original MINT reference implementation by authors)
     See mint/README.md for original documentation
@@ -154,6 +162,22 @@ embed_dim                   Explicit embedding dimension (optional). Can overrid
   Default: auto (from MODEL_REGISTRY[size])
 
 try_flex                    Use the flex attention variant (MINT_flex).
+  Type: bool
+  Default: false
+
+architecture                Model architecture variant. Determines which
+                            layer implementation and training scheme to use.
+                              "standard": Pre-LN, additive residuals (ESM-2 compat)
+                              "mus":      Res-Post-LN, weighted residuals,
+                                          sqrt-softmax, unit-variance init
+                              "fp8":      Pre-LN + te.Linear (FP8 compute)
+  Type: string
+  Default: "standard"
+
+warm_start_esm2             When using "mus" architecture, load compatible
+                            ESM-2 weights (~85% of params) and initialize
+                            the rest randomly. The incompatible keys
+                            (self_attn_layer_norm, absent in muS) are dropped.
   Type: bool
   Default: false
 
@@ -257,8 +281,43 @@ use_compile                 Enable torch.compile(model, mode='reduce-overhead').
 fp8                         Enable fp8-aware optimizer configuration. Not a
                             full fp8 training mode -- just adjusts the optimizer
                             parameter groups with scaled LR for hidden layers.
+                            When architecture: mus or fp8, this also enables
+                            FP8 computation via te.Linear on all hidden layers.
   Type: bool
   Default: false
+
+fp8_static_scaling          Use muS-style static FP8 scaling instead of
+                            TransformerEngine's default DelayedScaling.
+                            When true, no amax history or reduce-max operations
+                            are needed. The scale factor is 1/sqrt(fan_in)
+                            for each linear layer.
+                            When false (and fp8=true), uses DelayedScaling.
+  Type: bool
+  Default: true
+
+tau                         Residual coefficient for weighted skip connections
+                            in the muS architecture. Controls the balance
+                            between the residual stream and each branch output:
+                              x' = sqrt(1-tau) * x + sqrt(tau) * branch(x)
+                            Auto-computed from depth if not specified:
+                              L=6  -> ~0.20   (8M)
+                              L=30 -> ~0.09   (150M)
+                              L=33 -> ~0.09   (650M)
+  Type: float or null
+  Default: null (auto-computed)
+
+use_sqrt_softmax            Apply square-root to softmax outputs for variance
+                            preservation (muS paper Section 2.1). Only used
+                            when architecture: mus.
+  Type: bool
+  Default: true
+
+base_width                  Base model width for muS hyperparameter transfer.
+                            Hidden-layer LRs are scaled by sqrt(base_width / d).
+                            Set to the embed_dim of the model used for LR tuning.
+                            Default: 320 (ESM-2 8M embed_dim).
+  Type: int
+  Default: 320
 
 use_muon                    Use MuonAdamW optimizer (Newton-Schulz based)
                             instead of AdamW.
@@ -308,10 +367,10 @@ data: section
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 data_dir                    Directory containing the STRING-DB dataset files
-                            (training_filtered.links.txt.gz,
-                             training_filtered.seqs.txt.gz,
-                             validation.links.txt.gz,
-                             validation.seqs.txt.gz).
+                            (training_filtered.links.txt.zst,
+                             training_filtered.seqs.txt.zst,
+                             validation.links.txt.zst,
+                             validation.seqs.txt.zst).
   Type: string
   Default: "./data"
 
@@ -416,6 +475,21 @@ Create a custom config by extending a base:
     run_name: 150M_paper_config
     checkpoint_every: 2000
 
+Train with muS architecture + FP8 (training from scratch or warm-start):
+
+  python -m mint_plus train --config configs/recipes/mu_fp8_150M.yaml
+
+Train with FP8 on Pre-LN (full ESM-2 weight compatibility):
+
+  python -m mint_plus train --config configs/recipes/fp8_150M.yaml
+
+Use muS programmatically:
+
+  from mint_plus.models.mu_scaling import build_mint_mu
+  model = build_mint_mu("150M", use_fp8=True, warm_start_esm2=True)
+  model = model.cuda().to(torch.bfloat16)
+  # ... your training loop ...
+
 ================================================================================
 Model Sizes (MODEL_REGISTRY)
 ================================================================================
@@ -481,6 +555,55 @@ Key Optimizations
   projections. At E >= 1280 (650M+), this is faster than 3 separate GEMMs.
   At E=640 (150M), separate GEMMs are 9% faster.
 
+7. muS (unit Scaling) Architecture + FP8 Training
+
+  Based on Narayan et al. "unit Scaling: Simple and Scalable FP8 LLM Training"
+  (2025). Implements two complementary modes:
+
+  a) muS Architecture (model.architecture: mus)
+
+     Res-Post-LayerNorm: moves LayerNorm from the start of each residual
+     branch to the end. Combined with weighted residuals (x' = sqrt(1-tau)*x +
+     sqrt(tau)*branch(x)), this ensures consistent activation variance across
+     all tokens regardless of sequence position (Fig. 4 in paper).
+
+     Square-root softmax: applies sqrt() to the combined attention distribution
+     before the weighted sum. This is variance-preserving for independent value
+     tokens (paper Prop. 2.1), preventing variance collapse in deeper layers.
+     Supported natively in both the standard PyTorch path and the super-fused
+     Triton kernel (via the SQRT_SOFTMAX compile-time flag). The online softmax
+     accumulator uses sqrt(old_scale) rescaling and sqrt(d) normalization, with
+     the matching backward formula (gradient through sqrt).
+
+     Unit-variance initialization: all weights initialized with std=1.0 instead
+     of Xavier, with the output scaling (1/sqrt(fan_in)) applied at runtime.
+
+  b) FP8 Computation (training.fp8: true)
+
+     Uses TransformerEngine's te.Linear on all hidden linear layers (QKV
+     projections, FFN, output projection). RTX 5000 Ada FP8 Tensor Cores
+     provide ~2x throughput vs BF16.
+
+     muS-style static scaling: instead of TransformerEngine's default
+     DelayedScaling (which computes absolute max per tensor per step), muS
+     uses a constant alpha = 1/sqrt(fan_in). This eliminates amax history
+     buffers, reduce-max kernel launches, and scale-factor computation.
+
+     Expected speedup: 25-33% over BF16 at 150M (paper reports consistent
+     results at 1B-13B scale).
+
+  c) Pre-Trained Weight Compatibility
+
+     muS architecture: ~85% of ESM-2 weights transfer directly (all Linear
+     weights + embeddings). The self_attn_layer_norm keys (20 per 150M model)
+     are dropped (absent in Res-Post-LN). Use warm_start_from_esm2().
+
+     FP8 on Pre-LN: 100% weight compatibility. No architectural changes.
+
+  Two config recipes provided:
+    configs/recipes/mu_fp8_150M.yaml     -- muS + FP8 (train from scratch)
+    configs/recipes/fp8_150M.yaml        -- FP8 on Pre-LN (fine-tune ESM-2)
+
 ================================================================================
 Performance Benchmarks
 ================================================================================
@@ -511,14 +634,13 @@ Turing (RTX 2080 Ti) Compatibility
 
 ================================================================================
 Data Format
-================================================================================
 
-The STRINGDataset reads two gzip files:
+The STRINGDataset reads two zstd-compressed files:
 
-  training_filtered.links.txt.gz    -- PPI pairs (tab-separated: name1 name2)
-  training_filtered.seqs.txt.gz     -- Sequences (tab-separated: name seq)
-  validation.links.txt.gz           -- Same format for validation
-  validation.seqs.txt.gz            -- Same format for validation
+  training_filtered.links.txt.zst    -- PPI pairs (tab-separated: name1 name2)
+  training_filtered.seqs.txt.zst     -- Sequences (tab-separated: name seq)
+  validation.links.txt.zst           -- Same format for validation
+  validation.seqs.txt.zst            -- Same format for validation
 
 The CollateFn encodes each chain with:
   "<cls>" + seq.replace("J", "L") + "<eos>"
