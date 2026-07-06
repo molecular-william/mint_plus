@@ -61,7 +61,7 @@ class MINTTrainer:
         trainer = pl.Trainer(
             default_root_dir=f"./ckpts/{run_name}",
             accelerator=accelerator,
-            devices=torch.cuda.device_count(),
+            devices=torch.cuda.device_count() if accelerator == 'gpu' else 1,
             max_steps=self.max_steps,
             num_sanity_val_steps=2,
             enable_progress_bar=True,

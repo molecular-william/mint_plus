@@ -20,7 +20,7 @@ training:
   val_check_interval: 2000
   checkpoint_block_size: 0
   use_fused_multi_pathway: true
-  use_compile: true  # torch.compile disabled by default (causes CUDA errors)
+  use_compile: false  # torch.compile disabled by default (causes CUDA errors)
   
 
 data:
