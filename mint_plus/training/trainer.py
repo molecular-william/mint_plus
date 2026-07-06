@@ -1,6 +1,6 @@
 import lightning as pl
 import torch
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from typing import Any, Dict, Optional
 from pathlib import Path
 # from lightning.pytorch.strategies import DDPStrategy
@@ -19,6 +19,27 @@ from mint_plus.training.config import load_config
 
 logger = get_logger(__name__)
 torch.set_float32_matmul_precision('medium')  # medium
+
+
+class VRAMReporter(Callback):
+    """Log VRAM usage once on the first training step."""
+
+    def __init__(self):
+        self._reported = False
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self._reported or not torch.cuda.is_available():
+            return
+        self._reported = True
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        max_allocated = torch.cuda.max_memory_allocated() / 1e9
+        logger.info(
+            f"VRAM \u2014 allocated: {allocated:.2f} GB, "
+            f"reserved: {reserved:.2f} GB, "
+            f"peak so far: {max_allocated:.2f} GB"
+        )
+
 
 # use config yaml files
 class MINTTrainer:
@@ -67,7 +88,7 @@ class MINTTrainer:
             enable_progress_bar=True,
            # gradient_clip_val=self.training_config.get("grad_clip", 1.0),  # AdamW fused doesn't need this
             enable_checkpointing=True,
-            callbacks=[ModelCheckpoint(dirpath=f"./ckpts/{run_name}", every_n_train_steps=checkpoint_interval),],
+            callbacks=[ModelCheckpoint(dirpath=f"./ckpts/{run_name}", every_n_train_steps=checkpoint_interval), VRAMReporter()],
             accumulate_grad_batches=self.accu_grad,
             val_check_interval=val_check_interval,
             strategy=self.strategy,
